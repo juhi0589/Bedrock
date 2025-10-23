@@ -9,20 +9,40 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    parallel: true
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2' # or match what you need
+          extensions: mbstring, intl, zip, xml
 
       - name: Cache Composer dependencies
         uses: actions/cache@v4
         with:
-          path: vendor
+          path: |
+            vendor
+            ~/.composer/cache
           key: composer-${{ hashFiles('composer.lock') }}
 
       - name: Composer install (Bedrock core)
         run: composer install --no-interaction --no-progress --prefer-dist
 
-      - name: Build Sage assets (npm install/build)
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            web/app/themes/sage/node_modules
+          key: npm-${{ hashFiles('web/app/themes/sage/package-lock.json') }}
+
+      - name: Build Sage assets
         working-directory: web/app/themes/sage
         run: |
           npm install
@@ -41,29 +61,31 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
           name: site
 
-      - name: Deploy to VM via SSH
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Copy build to VM
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no site.tar.gz $VM_USER@$VM_HOST:/tmp/site.tar.gz
+
+      - name: Extract and deploy on VM
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
           VM_PATH: ${{ secrets.VM_PATH }}
-          VM_KEY: ${{ secrets.VM_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          echo "${VM_KEY}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no site.tar.gz $VM_USER@$VM_HOST:/tmp/site.tar.gz
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no $VM_USER@$VM_HOST "
-            mkdir -p $VM_PATH/current
-            tar -xzf /tmp/site.tar.gz -C $VM_PATH/current --strip-components=1
-            rm /tmp/site.tar.gz
-          "
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no $VM_USER@$VM_HOST "mkdir -p $VM_PATH/current && tar -xzf /tmp/site.tar.gz -C $VM_PATH/current --strip-components=1 && rm /tmp/site.tar.gz"
 
-      - name: Health check
+      - name: Health check deployed site
         run: curl -f ${{ secrets.APP_URL }}${{ secrets.HEALTH_PATH }}
