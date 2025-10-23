@@ -1,197 +1,69 @@
 name: Build & Deploy Bedrock
 
 on:
-  push:
-    branches: [ "main" ]   # change if your branch isn't 'main'
   workflow_dispatch:
-
-env:
-  NODE_VERSION: "18"
-  PHP_VERSION: "8.2"
-  APP_URL: ${{ secrets.APP_URL }}
-  HEALTH_PATH: ${{ secrets.HEALTH_PATH }}
+  push:
+    branches:
+      - main
 
 jobs:
-  composer:
+  build:
     runs-on: ubuntu-latest
+    parallel: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Composer
+      - name: Cache Composer dependencies
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.composer/cache
-            vendor
-          key: composer-${{ hashFiles('**/composer.lock') }}
-          restore-keys: composer-
-
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ env.PHP_VERSION }}
-          tools: composer
-          coverage: none
-          extensions: mbstring, curl, zip, dom, intl, gd, bcmath, xml
-
-      - name: Composer install (no dev)
-        run: composer install --no-dev --prefer-dist --no-interaction --no-progress
-
-      - name: Upload vendor
-        uses: actions/upload-artifact@v4
-        with:
-          name: vendor-artifact
           path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
 
-  sage:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
+      - name: Composer install (Bedrock core)
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Build Sage assets (npm install/build)
         working-directory: web/app/themes/sage
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache npm
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.npm
-            web/app/themes/sage/node_modules
-          key: npm-${{ hashFiles('web/app/themes/sage/package-lock.json') }}
-          restore-keys: npm-
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: web/app/themes/sage/package-lock.json
-
-      - name: Install & build
         run: |
-          npm ci || npm install --no-audit --no-fund --legacy-peer-deps
+          npm install
           npm run build
-        env:
-          CI: "true"
 
-      - name: Upload theme build
+      - name: Archive build for deployment
+        run: tar -czf site.tar.gz web
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sage-build
-          path: |
-            web/app/themes/sage/public
-            web/app/themes/sage/dist
-            web/app/themes/sage/.budfiles
-          if-no-files-found: ignore
-
-  package:
-    runs-on: ubuntu-latest
-    needs: [composer, sage]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download vendor
-        uses: actions/download-artifact@v4
-        with:
-          name: vendor-artifact
-          path: vendor
-
-      - name: Download theme build
-        uses: actions/download-artifact@v4
-        with:
-          name: sage-build
-          path: web/app/themes/sage
-
-      - name: Create tarball
-        run: |
-          RELEASE="release-$(date +%Y%m%d%H%M%S).tar.gz"
-          tar -czf "$RELEASE" web composer.json composer.lock vendor
-          echo "RELEASE_NAME=$RELEASE" >> $GITHUB_ENV
-
-      - name: Upload release
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RELEASE_NAME }}
-          path: ${{ env.RELEASE_NAME }}
+          name: site
+          path: site.tar.gz
 
   deploy:
+    needs: build
     runs-on: ubuntu-latest
-    needs: [package]
     steps:
-      - name: Download artifacts
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
         uses: actions/download-artifact@v4
+        with:
+          name: site
 
-      - name: Show files (debug)
-        run: ls -lah
-
-      - name: Pick latest release
-        id: pick
+      - name: Deploy to VM via SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PATH: ${{ secrets.VM_PATH }}
+          VM_KEY: ${{ secrets.VM_KEY }}
         run: |
-          ls -1 *.tar.gz | sort | tail -n1 > latest.txt
-          echo "name=$(cat latest.txt)" >> $GITHUB_OUTPUT
-
-      - name: Write SSH key
-        run: |
-          echo "${{ secrets.VM_KEY }}" > key.pem
-          chmod 600 key.pem
-
-      - name: Upload to VM
-        run: |
-          scp -i key.pem -o StrictHostKeyChecking=no "$(cat latest.txt)" ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/tmp/
-
-      - name: Atomic deploy on VM
-        run: |
-          ssh -i key.pem -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'EOF'
-          set -e
-          APP_PATH="${{ secrets.VM_PATH || '/var/www/bedrock' }}"
-          REL_DIR="$APP_PATH/releases/$(date +%Y%m%d%H%M%S)"
-          CUR="$APP_PATH/current"
-          PREV="$APP_PATH/previous"
-
-          mkdir -p "$REL_DIR"
-          TARBALL=$(ls -1 /tmp | grep -E 'release-.*\.tar\.gz' | tail -n1)
-          tar -xzf "/tmp/$TARBALL" -C "$REL_DIR"
-
-          if [ -f "$APP_PATH/shared/.env" ]; then
-            ln -sf "$APP_PATH/shared/.env" "$REL_DIR/.env"
-          fi
-
-          if [ -L "$CUR" ]; then
-            rm -f "$PREV"
-            mv -T "$CUR" "$PREV" || true
-          fi
-          ln -sfn "$REL_DIR" "$CUR"
-
-          sudo systemctl reload nginx || true
-          sudo systemctl reload php8.2-fpm || sudo systemctl reload php8.1-fpm || true
-          EOF
+          mkdir -p ~/.ssh
+          echo "${VM_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no site.tar.gz $VM_USER@$VM_HOST:/tmp/site.tar.gz
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no $VM_USER@$VM_HOST "
+            mkdir -p $VM_PATH/current
+            tar -xzf /tmp/site.tar.gz -C $VM_PATH/current --strip-components=1
+            rm /tmp/site.tar.gz
+          "
 
       - name: Health check
-        id: health
-        run: |
-          URL="${{ env.APP_URL }}"
-          PATH_="${{ env.HEALTH_PATH || '/' }}"
-          if [ -z "$URL" ]; then URL="http://${{ secrets.VM_HOST }}/"; fi
-          echo "Checking $URL$PATH_ ..."
-          for i in {1..10}; do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL$PATH_") || true
-            echo "Attempt $i -> $CODE"
-            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then exit 0; fi
-            sleep 3
-          done
-          exit 1
-
-      - name: Rollback if unhealthy
-        if: failure() && steps.health.outcome == 'failure'
-        run: |
-          ssh -i key.pem -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'EOF'
-          set -e
-          APP_PATH="${{ secrets.VM_PATH || '/var/www/bedrock' }}"
-          CUR="$APP_PATH/current"
-          PREV="$APP_PATH/previous"
-          if [ -L "$PREV" ]; then
-            ln -sfn "$(readlink -f $PREV)" "$CUR"
-            sudo systemctl reload nginx || true
-            sudo systemctl reload php8.2-fpm || sudo systemctl reload php8.1-fpm || true
-          fi
-          EOF
+        run: curl -f ${{ secrets.APP_URL }}${{ secrets.HEALTH_PATH }}
